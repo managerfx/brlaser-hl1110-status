@@ -19,8 +19,11 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cups/cups.h>
 #include <cups/raster.h>
-#include <algorithm>
+#include <cups/sidechannel.h>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <array>
@@ -28,6 +31,7 @@
 #include "config.h"
 #include "job.h"
 #include "debug.h"
+#include "status.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -39,6 +43,133 @@ namespace {
 cups_raster_t *ras;
 volatile sig_atomic_t interrupted = 0;
 
+
+bool query_hl1110(const char *command, double timeout, std::string *response) {
+  fputs("\033%-12345X@PJL\r\n@PJL ", stdout);
+  fputs(command, stdout);
+  fputs("\r\n\033%-12345X", stdout);
+  fflush(stdout);
+
+  char side_data[16];
+  int side_length = sizeof(side_data);
+  if (cupsSideChannelDoRequest(CUPS_SC_CMD_DRAIN_OUTPUT, side_data,
+                               &side_length, timeout) != CUPS_SC_STATUS_OK) {
+    return false;
+  }
+
+  fputc('\033', stdout);
+  fflush(stdout);
+  side_length = sizeof(side_data);
+  if (cupsSideChannelDoRequest(CUPS_SC_CMD_DRAIN_OUTPUT, side_data,
+                               &side_length, timeout) != CUPS_SC_STATUS_OK) {
+    return false;
+  }
+
+  char buffer[1024];
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const ssize_t bytes = cupsBackChannelRead(buffer, sizeof(buffer),
+                                               attempt == 0 ? timeout : 0.25);
+    if (bytes <= 0) {
+      break;
+    }
+    response->append(buffer, static_cast<size_t>(bytes));
+  }
+  return true;
+}
+
+
+void report_hl1110_status() {
+  const char *device_uri = getenv("DEVICE_URI");
+  if (!device_uri || !strstr(device_uri, "usb://Brother/HL-1110")) {
+    return;
+  }
+
+  std::string response;
+  const bool first_status = query_hl1110("INFO STATUS", 3.0, &response);
+  const bool page_count_status = query_hl1110("INFO PAGECOUNT", 2.0, &response);
+  const bool final_status = query_hl1110("INFO STATUS", 2.0, &response);
+  if (!first_status && !page_count_status && !final_status) {
+    fprintf(stderr, "WARNING: " PACKAGE ": Could not drain output before status query.\n");
+    return;
+  }
+
+  int code = -1;
+  int page_count = -1;
+  const bool has_code = pjl_nonnegative_number(response, "CODE", &code);
+  const bool has_page_count = pjl_nonnegative_number(response, "PAGECOUNT", &page_count);
+  const std::string display = pjl_value(response, "DISPLAY");
+
+  if (!has_code && display.empty()) {
+    fprintf(stderr, "WARNING: " PACKAGE ": Printer did not return PJL status.\n");
+    return;
+  }
+
+  fputs("STATE: -toner-low toner-empty marker-supply-low marker-supply-empty "
+        "media-empty media-jam cover-open opc-near-eol opc-life-over "
+        "com.brlaser.offline com.brlaser.service-needed\n", stderr);
+  fputs("ATTR: marker-colors=#000000,none marker-high-levels=100,100 "
+        "marker-low-levels=5,5 marker-names='\"Black Toner\"','\"Drum\"' "
+        "marker-types=toner,opc marker-levels=-2,-2 marker-message=''\n", stderr);
+
+  const char *status_message = "Ready";
+  switch (classify_hl1110_status(code, display)) {
+    case hl1110_status::offline:
+      fputs("STATE: +com.brlaser.offline\n", stderr);
+      status_message = "Offline";
+      break;
+    case hl1110_status::warming_up:
+      status_message = "Warming up";
+      break;
+    case hl1110_status::toner_empty:
+      fputs("STATE: +toner-empty marker-supply-empty\n", stderr);
+      fputs("ATTR: marker-levels=0,-2\n", stderr);
+      status_message = "Replace toner";
+      break;
+    case hl1110_status::toner_low:
+      fputs("STATE: +toner-low marker-supply-low\n", stderr);
+      status_message = "Toner low";
+      break;
+    case hl1110_status::media_empty:
+      fputs("STATE: +media-empty\n", stderr);
+      status_message = "No paper";
+      break;
+    case hl1110_status::media_jam:
+      fputs("STATE: +media-jam\n", stderr);
+      status_message = "Paper jam";
+      break;
+    case hl1110_status::cover_open:
+      fputs("STATE: +cover-open\n", stderr);
+      status_message = "Cover open";
+      break;
+    case hl1110_status::drum_low:
+      fputs("STATE: +opc-near-eol\n", stderr);
+      status_message = "Drum life low";
+      break;
+    case hl1110_status::drum_empty:
+      fputs("STATE: +opc-life-over\n", stderr);
+      fputs("ATTR: marker-levels=-2,0\n", stderr);
+      status_message = "Replace drum";
+      break;
+    case hl1110_status::service_needed:
+      fputs("STATE: +com.brlaser.service-needed\n", stderr);
+      status_message = "Service required";
+      break;
+    case hl1110_status::ready:
+      break;
+  }
+
+  std::string marker_message = status_message;
+  if (has_code) {
+    marker_message += "; PJL " + std::to_string(code);
+  }
+  if (has_page_count) {
+    marker_message += "; pages printed: " + std::to_string(page_count);
+  }
+  fprintf(stderr, "ATTR: marker-message='%s'\n", marker_message.c_str());
+
+  fprintf(stderr, "INFO: " PACKAGE ": PJL status CODE=%d DISPLAY=%s PAGECOUNT=%d\n",
+          code, display.empty() ? "unknown" : display.c_str(), page_count);
+}
 
 void sigterm_handler(int sig) {
   interrupted = 1;
@@ -203,5 +334,6 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "DEBUG: " PACKAGE ": Could not write print data. Most likely the CUPS backend failed.\n");
     return 1;
   }
+  report_hl1110_status();
   return 0;
 }

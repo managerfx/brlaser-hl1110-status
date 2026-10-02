@@ -108,7 +108,7 @@ configure_file(
 
 include_directories("${PROJECT_BINARY_DIR}")
 
-add_executable(rastertobrlaser src/main.cc src/job.cc src/line.cc src/debug.cc)
+add_executable(rastertobrlaser src/main.cc src/job.cc src/line.cc src/debug.cc src/status.cc)
 target_compile_options(rastertobrlaser PRIVATE ${CUPS_CFLAGS})
 target_link_libraries(rastertobrlaser ${CUPS_LIBS})
 target_link_libraries(rastertobrlaser ${CUPS_LDFLAGS})
@@ -118,16 +118,22 @@ add_executable(test_lest test/test_lest.cc)
 add_executable(test_line test/test_line.cc src/line.cc)
 add_executable(test_block test/test_block.cc)
 add_executable(test_job test/test_job.cc src/job.cc src/line.cc)
+add_executable(test_status test/test_status.cc src/status.cc)
 
 enable_testing()
 add_test(test_lest test_lest)
 add_test(test_line test_line)
 add_test(test_block test_block)
 add_test(test_job test_job)
+add_test(test_status test_status)
+find_program(PYTHON3_EXECUTABLE NAMES python3)
+if(PYTHON3_EXECUTABLE)
+  add_test(test_reset_tool ${PYTHON3_EXECUTABLE} "${PROJECT_SOURCE_DIR}/test/test_reset_tool.py")
+endif()
 
 # Autotools-style "make check" command
 add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND})
-add_dependencies(check test_lest test_line test_block test_job)
+add_dependencies(check test_lest test_line test_block test_job test_status)
 
 
 # Installation
@@ -138,3 +144,7 @@ install(
 install(
   FILES "${PROJECT_BINARY_DIR}/brlaser.drv"
   DESTINATION "${CUPS_DATA_DIR}/drv")
+install(
+  PROGRAMS tools/brlaser-hl1110-reset.py
+  RENAME brlaser-hl1110-reset
+  DESTINATION sbin)
